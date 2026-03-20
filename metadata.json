@@ -1,0 +1,5 @@
+{
+  "name": "PDF Splitter & Namer",
+  "description": "Upload multi-page PDFs, preview 2-page segments, name them, and export them individually.",
+  "requestFramePermissions": []
+}
