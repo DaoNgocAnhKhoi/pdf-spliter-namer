@@ -119,6 +119,7 @@ export default function App() {
   const [isParsing, setIsParsing] = useState(false);
   const [completedPairs, setCompletedPairs] = useState<Set<number>>(new Set());
   const [pagesPerBatch, setPagesPerBatch] = useState(2);
+  const [jumpPage, setJumpPage] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -210,6 +211,23 @@ export default function App() {
     if (currentIndex - pagesPerBatch >= 0) {
       setCurrentIndex(currentIndex - pagesPerBatch);
     }
+  };
+
+  const handleJumpPrompt = () => {
+    const input = prompt("Nhập số trang muốn tới:");
+
+    if (!input) return;
+
+    const page = Number(input);
+
+    if (isNaN(page) || page < 1 || page > totalPages) {
+      alert("Trang không hợp lệ!");
+      return;
+    }
+
+    const newIndex = Math.floor((page - 1) / pagesPerBatch) * pagesPerBatch;
+
+    setCurrentIndex(newIndex);
   };
 
   const reset = () => {
@@ -309,11 +327,12 @@ export default function App() {
                     </h2>
                     <p className="text-zinc-500 text-sm mt-1">
                       Đang xem trang {currentIndex + 1} -{" "}
-                      {Math.min(currentIndex + 2, totalPages)} trên tổng số{" "}
-                      {totalPages} trang
+                      {Math.min(currentIndex + pagesPerBatch, totalPages)} trên
+                      tổng số {totalPages} trang
                     </p>
                   </div>
-                  <div className="flex gap-2">
+                  <div className="flex items-center gap-2">
+                    {/* PREV */}
                     <button
                       onClick={handlePrev}
                       disabled={currentIndex === 0}
@@ -321,9 +340,19 @@ export default function App() {
                     >
                       <ChevronLeft className="w-6 h-6" />
                     </button>
+
+                    {/* JUMP */}
+                    <button
+                      onClick={handleJumpPrompt}
+                      className="px-3 py-1.5 text-sm font-semibold border border-zinc-200 rounded-lg hover:bg-zinc-100 transition"
+                    >
+                      Jump
+                    </button>
+
+                    {/* NEXT */}
                     <button
                       onClick={handleNext}
-                      disabled={currentIndex + 2 >= totalPages}
+                      disabled={currentIndex + pagesPerBatch >= totalPages}
                       className="p-2 rounded-full hover:bg-zinc-100 disabled:opacity-30 transition-colors"
                     >
                       <ChevronRight className="w-6 h-6" />
