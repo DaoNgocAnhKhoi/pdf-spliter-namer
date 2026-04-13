@@ -249,7 +249,7 @@ export default function App() {
               <FileText className="w-5 h-5 text-white" />
             </div>
             <h1 className="font-semibold tracking-tight text-lg">
-              PDF Splitter
+              PDF Splitter & Namer by Ban Quân lực Tân Sơn Nhì
             </h1>
           </div>
           {file && (
