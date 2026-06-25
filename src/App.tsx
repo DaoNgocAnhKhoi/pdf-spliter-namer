@@ -63,10 +63,10 @@ type WorkProgress = {
 // Thay các đường dẫn dưới đây bằng ảnh landscape của bạn.
 // Nên dùng ảnh tỉ lệ 16:9 hoặc 3:2, đặt trong thư mục public/images/pdf-toolkit/.
 const HOME_IMAGES = {
-  hero: "/public/images/tap_vo.jpg",
-  workflow: "/public/images/hanh_quan.jpg",
-  ordering: "/public/images/hanh_quan_2.jpg",
-  closing: "/public/images/tet.jpg",
+  hero: "/images/tap_vo.jpg",
+  workflow: "/images/hanh_quan.jpg",
+  ordering: "/images/hanh_quan_2.jpg",
+  closing: "/images/tet.jpg",
 };
 
 interface PagePreviewProps {
