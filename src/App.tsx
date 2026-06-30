@@ -65,7 +65,7 @@ type WorkProgress = {
 const HOME_IMAGES = {
   hero: "/images/tap_vo.jpg",
   workflow: "/images/hanh_quan.jpg",
-  ordering: "/images/hanh_quan_2.jpg",
+  ordering: "/images/a7_khoc.jpg",
   closing: "/images/tet.jpg",
 };
 
