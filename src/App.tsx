@@ -81,6 +81,49 @@ interface SelectedFileListProps {
   disabled?: boolean;
 }
 
+type SplitRange = {
+  startIndex: number;
+  endIndexExclusive: number;
+  pageIndices: number[];
+};
+
+/**
+ * Trả về đúng tập trang đang xem và sẽ được xuất.
+ * Mọi nơi (preview, tên file, export, điều hướng) đều dùng chung hàm này
+ * để không còn tình trạng màn hình hiển thị một nhóm nhưng file tải về là nhóm khác.
+ */
+function getSplitRange(
+  startIndex: number,
+  totalPages: number,
+  pagesPerBatch: number,
+): SplitRange {
+  const safeTotalPages = Math.max(0, totalPages);
+  const safePagesPerBatch = Math.max(1, Math.floor(pagesPerBatch));
+  const maxStartIndex = Math.max(0, safeTotalPages - 1);
+  const safeStartIndex = Math.min(Math.max(0, startIndex), maxStartIndex);
+  const endIndexExclusive = Math.min(
+    safeStartIndex + safePagesPerBatch,
+    safeTotalPages,
+  );
+
+  return {
+    startIndex: safeStartIndex,
+    endIndexExclusive,
+    pageIndices: Array.from(
+      { length: Math.max(0, endIndexExclusive - safeStartIndex) },
+      (_, offset) => safeStartIndex + offset,
+    ),
+  };
+}
+
+function makeDefaultSplitFileName(
+  sourceFileName: string,
+  startIndex: number,
+  endIndexExclusive: number,
+) {
+  return `${stripExtension(sourceFileName)}_trang_${startIndex + 1}-${endIndexExclusive}`;
+}
+
 const setWorker = () => {
   if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
     pdfjsLib.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/build/pdf.worker.min.mjs`;
@@ -378,43 +421,55 @@ const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let isMounted = true;
+    let disposed = false;
+    let cancelRender: (() => void) | undefined;
 
     const renderPage = async () => {
-      if (!pdfDoc || !canvasRef.current) return;
+      const canvas = canvasRef.current;
+      if (!pdfDoc || !canvas) return;
 
       setIsLoading(true);
       setError(null);
 
       try {
         const page = await pdfDoc.getPage(pageNumber);
-        const viewport = page.getViewport({ scale: 2 });
-        const canvas = canvasRef.current;
-        const context = canvas.getContext("2d");
+        if (disposed) return;
 
-        if (context && isMounted) {
-          canvas.height = viewport.height;
-          canvas.width = viewport.width;
-          context.clearRect(0, 0, canvas.width, canvas.height);
-          await page.render({ canvasContext: context, viewport }).promise;
-        }
+        const viewport = page.getViewport({ scale: 1.5 });
+        const context = canvas.getContext("2d");
+        if (!context || disposed) return;
+
+        // Xóa kích thước/canvas cũ trước khi vẽ trang mới.
+        canvas.width = Math.ceil(viewport.width);
+        canvas.height = Math.ceil(viewport.height);
+        context.clearRect(0, 0, canvas.width, canvas.height);
+
+        const renderTask = page.render({ canvasContext: context, viewport });
+        cancelRender = () => renderTask.cancel();
+        await renderTask.promise;
       } catch (err) {
-        console.error("Error rendering page:", err);
-        if (isMounted) setError("Không thể hiển thị trang");
+        // Khi đổi nhóm trang, tác vụ cũ được hủy chủ động. Đây không phải lỗi hiển thị.
+        const isCancelled =
+          err instanceof Error && err.name === "RenderingCancelledException";
+        if (!disposed && !isCancelled) {
+          console.error("Error rendering page:", err);
+          setError("Không thể hiển thị trang");
+        }
       } finally {
-        if (isMounted) setIsLoading(false);
+        if (!disposed) setIsLoading(false);
       }
     };
 
     void renderPage();
 
     return () => {
-      isMounted = false;
+      disposed = true;
+      cancelRender?.();
     };
   }, [pdfDoc, pageNumber]);
 
   return (
-    <div className="relative flex min-h-[400px] w-full flex-1 flex-col items-center justify-center overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-md transition-all hover:shadow-lg">
+    <div className="relative flex min-h-[280px] w-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-md transition-all hover:shadow-lg">
       {isLoading && (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-50/80">
           <Loader2 className="h-8 w-8 animate-spin text-zinc-900" />
@@ -425,11 +480,13 @@ const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
           <p className="text-sm font-medium text-red-500">{error}</p>
         </div>
       )}
-      <canvas
-        ref={canvasRef}
-        className="h-auto w-full object-contain"
-        style={{ imageRendering: "auto" }}
-      />
+      <div className="flex min-h-[236px] flex-1 items-center justify-center p-3">
+        <canvas
+          ref={canvasRef}
+          className="max-h-[420px] max-w-full object-contain"
+          style={{ imageRendering: "auto" }}
+        />
+      </div>
       <div className="w-full border-t border-zinc-100 bg-zinc-50 py-3 text-center text-sm font-bold uppercase tracking-tighter text-zinc-600">
         Trang {pageNumber}
       </div>
@@ -771,6 +828,7 @@ export default function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [isParsing, setIsParsing] = useState(false);
   const [pagesPerBatch, setPagesPerBatch] = useState(2);
+  const [isSplitFileNameAuto, setIsSplitFileNameAuto] = useState(true);
   const [completedBatchesBySize, setCompletedBatchesBySize] = useState<
     Record<number, Set<number>>
   >({});
@@ -815,12 +873,39 @@ export default function App() {
   const mergeAllInputRef = useRef<HTMLInputElement>(null);
   const batchSplitInputRef = useRef<HTMLInputElement>(null);
 
+  const currentSplitRange = getSplitRange(
+    currentIndex,
+    totalPages,
+    pagesPerBatch,
+  );
+  const currentPageIndices = currentSplitRange.pageIndices;
+  const currentPageStart = currentSplitRange.startIndex + 1;
+  const currentPageEnd = currentSplitRange.endIndexExclusive;
   const totalBatches = totalPages > 0 ? Math.ceil(totalPages / pagesPerBatch) : 0;
   const completedBatches = completedBatchesBySize[pagesPerBatch];
   const completedCount = completedBatches?.size ?? 0;
-  const currentBatchCompleted = completedBatches?.has(currentIndex) ?? false;
+  const currentBatchCompleted =
+    completedBatches?.has(currentSplitRange.startIndex) ?? false;
   const splitProgressPercent =
     totalBatches > 0 ? Math.min(100, (completedCount / totalBatches) * 100) : 0;
+
+  useEffect(() => {
+    if (!file || !isSplitFileNameAuto || currentPageIndices.length === 0) return;
+
+    setFileName(
+      makeDefaultSplitFileName(
+        file.name,
+        currentSplitRange.startIndex,
+        currentSplitRange.endIndexExclusive,
+      ),
+    );
+  }, [
+    file,
+    isSplitFileNameAuto,
+    currentPageIndices.length,
+    currentSplitRange.startIndex,
+    currentSplitRange.endIndexExclusive,
+  ]);
 
   const pairCount = Math.min(frontFiles.length, backFiles.length);
   const batchPairs = Array.from({ length: pairCount }, (_, index) => ({
@@ -852,11 +937,13 @@ export default function App() {
       setTotalPages(pdf.numPages);
       setCurrentIndex(0);
       setFileName(
-        `${stripExtension(uploadedFile.name)}_trang_1-${Math.min(
-          pagesPerBatch,
-          pdf.numPages,
-        )}`,
+        makeDefaultSplitFileName(
+          uploadedFile.name,
+          0,
+          Math.min(pagesPerBatch, pdf.numPages),
+        ),
       );
+      setIsSplitFileNameAuto(true);
       setCompletedBatchesBySize({});
     } catch (error) {
       console.error("Error parsing PDF:", error);
@@ -868,24 +955,33 @@ export default function App() {
   };
 
   const handleExport = async () => {
-    if (!file || isExporting) return;
+    if (!file || isExporting || currentPageIndices.length === 0) return;
 
     setIsExporting(true);
+
+    // Chụp lại nhóm trang hiện tại trước khi chạy bất đồng bộ để file tải về
+    // luôn khớp chính xác với preview đang có trên màn hình.
+    const pageIndicesToExtract = [...currentPageIndices];
+    const pageStart = currentPageStart;
+    const pageEnd = currentPageEnd;
+    const currentRangeStartIndex = currentSplitRange.startIndex;
 
     try {
       const originalPdf = await PDFDocument.load(await file.arrayBuffer());
       const newPdf = await PDFDocument.create();
-      const pagesToExtract = Array.from(
-        { length: pagesPerBatch },
-        (_, index) => currentIndex + index,
-      ).filter((index) => index < totalPages);
-      const copiedPages = await newPdf.copyPages(originalPdf, pagesToExtract);
+      const copiedPages = await newPdf.copyPages(
+        originalPdf,
+        pageIndicesToExtract,
+      );
       copiedPages.forEach((page) => newPdf.addPage(page));
 
-      const pageStart = currentIndex + 1;
-      const pageEnd = Math.min(currentIndex + pagesPerBatch, totalPages);
+      const fallbackName = makeDefaultSplitFileName(
+        file.name,
+        currentRangeStartIndex,
+        pageEnd,
+      );
       const outputName = safeFileName(
-        fileName.trim() || `${stripExtension(file.name)}_trang_${pageStart}-${pageEnd}`,
+        isSplitFileNameAuto ? fallbackName : fileName.trim() || fallbackName,
       );
 
       downloadBlob(
@@ -895,12 +991,13 @@ export default function App() {
 
       setCompletedBatchesBySize((previous) => {
         const completedForCurrentSize = new Set(previous[pagesPerBatch] ?? []);
-        completedForCurrentSize.add(currentIndex);
+        completedForCurrentSize.add(currentRangeStartIndex);
         return { ...previous, [pagesPerBatch]: completedForCurrentSize };
       });
 
-      if (currentIndex + pagesPerBatch < totalPages) {
-        setCurrentIndex(currentIndex + pagesPerBatch);
+      // Chuyển chính xác sang trang ngay sau trang cuối vừa xuất.
+      if (pageEnd < totalPages) {
+        setCurrentIndex(pageEnd);
       }
     } catch (error) {
       console.error("Export failed:", error);
@@ -911,27 +1008,30 @@ export default function App() {
   };
 
   const handlePagesPerBatchChange = (nextPagesPerBatch: number) => {
-    setPagesPerBatch(nextPagesPerBatch);
-    setCurrentIndex((previousIndex) =>
-      Math.floor(previousIndex / nextPagesPerBatch) * nextPagesPerBatch,
-    );
+    const nextSize = Math.max(1, Math.floor(nextPagesPerBatch));
+    if (nextSize === pagesPerBatch) return;
+
+    // QUAN TRỌNG: Không gọi setCurrentIndex ở đây.
+    // Ví dụ đang ở trang 5: đổi 2 → 4 trang phải hiển thị 5–8;
+    // đổi 4 → 1 trang vẫn phải giữ ở trang 5, không tự nhảy sang trang khác.
+    setPagesPerBatch(nextSize);
   };
 
   const handleNext = () => {
-    if (currentIndex + pagesPerBatch < totalPages) {
-      setCurrentIndex(currentIndex + pagesPerBatch);
+    if (currentPageEnd < totalPages) {
+      setCurrentIndex(currentPageEnd);
     }
   };
 
   const handlePrev = () => {
-    if (currentIndex - pagesPerBatch >= 0) {
-      setCurrentIndex(currentIndex - pagesPerBatch);
+    if (currentSplitRange.startIndex > 0) {
+      setCurrentIndex(Math.max(0, currentSplitRange.startIndex - pagesPerBatch));
     }
   };
 
   const handleJumpPrompt = () => {
-    const input = prompt("Nhập số trang muốn tới:");
-    if (!input) return;
+    const input = prompt(`Nhập trang bắt đầu muốn xem/tách (1–${totalPages}):`);
+    if (input === null || input.trim() === "") return;
 
     const page = Number(input);
     if (!Number.isInteger(page) || page < 1 || page > totalPages) {
@@ -939,7 +1039,8 @@ export default function App() {
       return;
     }
 
-    setCurrentIndex(Math.floor((page - 1) / pagesPerBatch) * pagesPerBatch);
+    // "Tới trang 5" luôn bắt đầu bằng trang 5, đúng với nội dung người dùng nhập.
+    setCurrentIndex(page - 1);
   };
 
   const handleBatchFiles = (
@@ -1284,6 +1385,7 @@ export default function App() {
     setTotalPages(0);
     setCurrentIndex(0);
     setFileName("");
+    setIsSplitFileNameAuto(true);
     setCompletedBatchesBySize({});
   };
 
@@ -1486,8 +1588,7 @@ export default function App() {
                       <div>
                         <h2 className="text-2xl font-bold tracking-tight">Xem trước trang</h2>
                         <p className="mt-1 text-sm text-zinc-500">
-                          Đang xem trang {currentIndex + 1} – {" "}
-                          {Math.min(currentIndex + pagesPerBatch, totalPages)} trên tổng số {" "}
+                          Đang chọn trang {currentPageStart} – {currentPageEnd} trên tổng số {" "}
                           {totalPages} trang
                         </p>
                       </div>
@@ -1504,11 +1605,11 @@ export default function App() {
                           onClick={handleJumpPrompt}
                           className="rounded-lg border border-zinc-200 px-3 py-1.5 text-sm font-semibold transition hover:bg-zinc-100"
                         >
-                          Tới trang
+                          Tới trang bắt đầu
                         </button>
                         <button
                           onClick={handleNext}
-                          disabled={currentIndex + pagesPerBatch >= totalPages}
+                          disabled={currentPageEnd >= totalPages}
                           className="rounded-full p-2 transition-colors hover:bg-zinc-100 disabled:opacity-30"
                           aria-label="Nhóm trang tiếp theo"
                         >
@@ -1518,24 +1619,20 @@ export default function App() {
                     </div>
 
                     <div className="flex min-h-[500px] flex-col gap-4 rounded-[32px] border border-zinc-200/60 bg-zinc-100/50 p-6">
-                      {Array.from({ length: pagesPerBatch }).map((_, index) => {
-                        const pageNumber = currentIndex + index + 1;
-                        if (pageNumber > totalPages) return null;
-                        return (
-                          <PagePreview
-                            key={pageNumber}
-                            pdfDoc={pdfDoc}
-                            pageNumber={pageNumber}
-                          />
-                        );
-                      })}
+                      {currentPageIndices.map((pageIndex) => (
+                        <PagePreview
+                          key={`${file.name}-${file.lastModified}-${pageIndex}`}
+                          pdfDoc={pdfDoc}
+                          pageNumber={pageIndex + 1}
+                        />
+                      ))}
                     </div>
                   </div>
 
                   <div className="h-fit space-y-8 lg:sticky lg:top-28 lg:col-span-5">
                     <div className="space-y-3">
                       <label className="text-xs font-bold uppercase tracking-widest text-zinc-400">
-                        Số trang mỗi lần tách
+                        Số trang của nhóm đang chọn
                       </label>
                       <div className="grid grid-cols-5 gap-2">
                         {Array.from({ length: 10 }).map((_, index) => {
@@ -1558,7 +1655,7 @@ export default function App() {
                         })}
                       </div>
                       <p className="text-xs text-zinc-400">
-                        Đang chọn: {" "}
+                        Nhóm hiện tại gồm tối đa {" "}
                         <span className="font-semibold text-zinc-700">
                           {pagesPerBatch} trang
                         </span>
@@ -1573,7 +1670,10 @@ export default function App() {
                         <input
                           type="text"
                           value={fileName}
-                          onChange={(event) => setFileName(event.target.value)}
+                          onChange={(event) => {
+                            setFileName(event.target.value);
+                            setIsSplitFileNameAuto(false);
+                          }}
                           placeholder="Nhập tên file..."
                           className="w-full rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 font-medium transition-all focus:border-zinc-900 focus:outline-none focus:ring-2 focus:ring-zinc-900/5"
                         />
@@ -1627,9 +1727,9 @@ export default function App() {
                         Hướng dẫn
                       </h3>
                       <ol className="space-y-3 text-sm text-zinc-600">
-                        <li>1. Chọn số trang cần có trong mỗi file xuất ra.</li>
-                        <li>2. Đặt tên file, sau đó nhấn “Tách và tải về”.</li>
-                        <li>3. Tiến độ được tính riêng theo số trang/lần tách đang chọn.</li>
+                        <li>1. Chọn số trang của nhóm đang xem; preview và file tải về luôn cùng một nhóm trang.</li>
+                        <li>2. “Tới trang bắt đầu” sẽ mở đúng trang bạn nhập làm trang đầu tiên của nhóm.</li>
+                        <li>3. Tên file tự đổi theo nhóm trang hiện tại; khi tự sửa tên, hệ thống sẽ giữ nguyên tên bạn đặt.</li>
                       </ol>
                     </div>
                   </div>
