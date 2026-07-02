@@ -22,8 +22,12 @@ import {
   FileText,
   Files,
   Loader2,
+  Maximize2,
+  RotateCcw,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
 import { clsx, type ClassValue } from "clsx";
@@ -415,10 +419,52 @@ const ProgressBar: React.FC<WorkProgress> = ({ completed, total }) => {
   );
 };
 
-const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
+type ReaderPreviewProps = {
+  pdfDoc: pdfjsLib.PDFDocumentProxy | null;
+  pageNumber: number;
+  onClose: () => void;
+};
+
+/**
+ * Chế độ đọc rõ: không cố ép trang A4/A3 vào một ô nhỏ.
+ * Trang được mở trên toàn bộ viewport và có thể zoom/scroll độc lập,
+ * nên chữ vẫn rõ dù trang dọc, ngang hoặc khổ lớn.
+ */
+const ReaderPreview: React.FC<ReaderPreviewProps> = ({
+  pdfDoc,
+  pageNumber,
+  onClose,
+}) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+  const [viewerSize, setViewerSize] = useState({ width: 0, height: 0 });
+  const [canvasCssSize, setCanvasCssSize] = useState({ width: 0, height: 0 });
+  const [zoom, setZoom] = useState(1);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const element = viewerRef.current;
+    if (!element) return;
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      const nextSize = {
+        width: Math.floor(rect.width),
+        height: Math.floor(rect.height),
+      };
+      setViewerSize((previous) =>
+        previous.width === nextSize.width && previous.height === nextSize.height
+          ? previous
+          : nextSize,
+      );
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -426,7 +472,9 @@ const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
 
     const renderPage = async () => {
       const canvas = canvasRef.current;
-      if (!pdfDoc || !canvas) return;
+      if (!pdfDoc || !canvas || viewerSize.width <= 0 || viewerSize.height <= 0) {
+        return;
+      }
 
       setIsLoading(true);
       setError(null);
@@ -435,20 +483,231 @@ const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
         const page = await pdfDoc.getPage(pageNumber);
         if (disposed) return;
 
-        const viewport = page.getViewport({ scale: 1.5 });
+        const baseViewport = page.getViewport({ scale: 1 });
+        const fitScale = Math.max(
+          0.05,
+          Math.min(
+            Math.max(1, viewerSize.width - 32) / baseViewport.width,
+            Math.max(1, viewerSize.height - 32) / baseViewport.height,
+          ),
+        );
+        const cssScale = fitScale * zoom;
+        const outputScale = Math.min(Math.max(window.devicePixelRatio || 1, 1), 2.5);
+        const renderViewport = page.getViewport({ scale: cssScale * outputScale });
         const context = canvas.getContext("2d");
         if (!context || disposed) return;
 
-        // Xóa kích thước/canvas cũ trước khi vẽ trang mới.
-        canvas.width = Math.ceil(viewport.width);
-        canvas.height = Math.ceil(viewport.height);
+        canvas.width = Math.ceil(renderViewport.width);
+        canvas.height = Math.ceil(renderViewport.height);
+        context.imageSmoothingEnabled = true;
         context.clearRect(0, 0, canvas.width, canvas.height);
+        setCanvasCssSize({
+          width: Math.round(baseViewport.width * cssScale),
+          height: Math.round(baseViewport.height * cssScale),
+        });
 
-        const renderTask = page.render({ canvasContext: context, viewport });
+        const renderTask = page.render({ canvasContext: context, viewport: renderViewport });
         cancelRender = () => renderTask.cancel();
         await renderTask.promise;
       } catch (err) {
-        // Khi đổi nhóm trang, tác vụ cũ được hủy chủ động. Đây không phải lỗi hiển thị.
+        const isCancelled =
+          err instanceof Error && err.name === "RenderingCancelledException";
+        if (!disposed && !isCancelled) {
+          console.error("Error rendering reader preview:", err);
+          setError("Không thể hiển thị trang");
+        }
+      } finally {
+        if (!disposed) setIsLoading(false);
+      }
+    };
+
+    void renderPage();
+
+    return () => {
+      disposed = true;
+      cancelRender?.();
+    };
+  }, [pdfDoc, pageNumber, viewerSize.height, viewerSize.width, zoom]);
+
+  const changeZoom = (delta: number) => {
+    setZoom((previous) => Math.min(3, Math.max(0.75, Number((previous + delta).toFixed(2)))));
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[100] flex min-h-[100dvh] flex-col bg-zinc-950/90 p-2 backdrop-blur-sm sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Đọc rõ trang ${pageNumber}`}
+    >
+      <div className="mx-auto flex w-full max-w-[1700px] shrink-0 items-center justify-between gap-3 rounded-xl border border-white/15 bg-zinc-900 px-3 py-2 text-white shadow-xl">
+        <div className="min-w-0">
+          <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-white/45">Chế độ đọc rõ</p>
+          <p className="truncate text-sm font-bold">Trang {pageNumber}</p>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => changeZoom(-0.25)}
+            disabled={zoom <= 0.75}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/5 text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-35"
+            aria-label="Thu nhỏ preview"
+            title="Thu nhỏ"
+          >
+            <ZoomOut className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoom(1)}
+            className="min-w-[58px] rounded-lg border border-white/15 bg-white/5 px-2 py-1.5 text-[11px] font-bold text-white transition hover:bg-white/15"
+            title="Đưa về vừa khung"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            onClick={() => changeZoom(0.25)}
+            disabled={zoom >= 3}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/5 text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-35"
+            aria-label="Phóng to preview"
+            title="Phóng to"
+          >
+            <ZoomIn className="h-4 w-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoom(1)}
+            className="hidden items-center gap-1 rounded-lg border border-white/15 bg-white/5 px-2 py-1.5 text-[11px] font-bold text-white transition hover:bg-white/15 sm:inline-flex"
+            title="Vừa khung"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            Vừa khung
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-white px-2.5 text-[11px] font-bold text-zinc-900 transition hover:bg-zinc-100"
+          >
+            <X className="h-4 w-4" />
+            Đóng
+          </button>
+        </div>
+      </div>
+
+      <div className="mx-auto mt-2 flex min-h-0 w-full max-w-[1700px] flex-1 overflow-hidden rounded-xl border border-white/15 bg-zinc-800 shadow-2xl">
+        <div
+          ref={viewerRef}
+          className="relative h-full min-h-0 w-full overflow-auto p-3 sm:p-4"
+        >
+          {isLoading && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-900/45">
+              <Loader2 className="h-7 w-7 animate-spin text-white" />
+            </div>
+          )}
+          {error && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-red-950/85 p-4 text-center">
+              <p className="text-sm font-medium text-red-100">{error}</p>
+            </div>
+          )}
+          <div className="flex min-h-full min-w-full items-center justify-center">
+            <canvas
+              ref={canvasRef}
+              className="block bg-white shadow-2xl"
+              style={{
+                width: `${canvasCssSize.width}px`,
+                height: `${canvasCssSize.height}px`,
+                imageRendering: "auto",
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      <p className="mx-auto mt-2 w-full max-w-[1700px] text-center text-[11px] font-medium text-white/60">
+        Dùng + / − để đọc rõ hơn; khi phóng to, cuộn ngay trong khung để xem phần còn lại của trang.
+      </p>
+    </div>
+  );
+};
+
+const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
+  const [previewWidth, setPreviewWidth] = useState(0);
+  const [canvasCssSize, setCanvasCssSize] = useState({ width: 0, height: 0 });
+  const [pageOrientation, setPageOrientation] = useState<"portrait" | "landscape">("portrait");
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isReaderOpen, setIsReaderOpen] = useState(false);
+
+  useEffect(() => {
+    const element = previewRef.current;
+    if (!element) return;
+
+    const updateWidth = () => {
+      const nextWidth = Math.floor(element.getBoundingClientRect().width);
+      setPreviewWidth((previous) =>
+        previous === nextWidth ? previous : nextWidth,
+      );
+    };
+
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let cancelRender: (() => void) | undefined;
+
+    const renderPage = async () => {
+      const canvas = canvasRef.current;
+      if (!pdfDoc || !canvas || previewWidth <= 0) return;
+
+      setIsLoading(true);
+      setError(null);
+
+      try {
+        const page = await pdfDoc.getPage(pageNumber);
+        if (disposed) return;
+
+        const baseViewport = page.getViewport({ scale: 1 });
+
+        // Vẫn giữ tỷ lệ gốc và đọc theo chiều dọc, nhưng giới hạn chiều rộng
+        // ở mức vừa phải: A4/A3 dọc không chiếm hết màn hình; giấy ngang có
+        // không gian rộng hơn. Người dùng vẫn có thể mở Toàn màn khi cần soi kỹ.
+        setPageOrientation(
+          baseViewport.width > baseViewport.height ? "landscape" : "portrait",
+        );
+        const cssScale = Math.max(0.05, previewWidth / baseViewport.width);
+        const outputScale = Math.min(
+          Math.max(window.devicePixelRatio || 1, 1),
+          2,
+        );
+        const renderViewport = page.getViewport({
+          scale: cssScale * outputScale,
+        });
+        const context = canvas.getContext("2d");
+        if (!context || disposed) return;
+
+        canvas.width = Math.ceil(renderViewport.width);
+        canvas.height = Math.ceil(renderViewport.height);
+        context.imageSmoothingEnabled = true;
+        context.clearRect(0, 0, canvas.width, canvas.height);
+        setCanvasCssSize({
+          width: Math.round(baseViewport.width * cssScale),
+          height: Math.round(baseViewport.height * cssScale),
+        });
+
+        const renderTask = page.render({
+          canvasContext: context,
+          viewport: renderViewport,
+        });
+        cancelRender = () => renderTask.cancel();
+        await renderTask.promise;
+      } catch (err) {
         const isCancelled =
           err instanceof Error && err.name === "RenderingCancelledException";
         if (!disposed && !isCancelled) {
@@ -466,34 +725,75 @@ const PagePreview: React.FC<PagePreviewProps> = ({ pdfDoc, pageNumber }) => {
       disposed = true;
       cancelRender?.();
     };
-  }, [pdfDoc, pageNumber]);
+  }, [pdfDoc, pageNumber, previewWidth]);
 
   return (
-    <div className="relative flex min-h-[280px] w-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-md transition-all hover:shadow-lg">
-      {isLoading && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-zinc-50/80">
-          <Loader2 className="h-8 w-8 animate-spin text-zinc-900" />
+    <>
+      <section
+        className={cn(
+          "group relative w-full shrink-0 overflow-hidden bg-zinc-200",
+          canvasCssSize.height > 0 ? "" : "min-h-[160px]",
+        )}
+      >
+        {isLoading && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/70 backdrop-blur-[1px]">
+            <Loader2 className="h-6 w-6 animate-spin text-zinc-900" />
+          </div>
+        )}
+        {error && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-red-50 p-4 text-center">
+            <p className="text-sm font-medium text-red-500">{error}</p>
+          </div>
+        )}
+
+        <div
+          ref={previewRef}
+          className={cn(
+            "relative mx-auto w-full bg-zinc-200",
+            // Kích thước mặc định cân bằng: đủ rõ để đọc, không quá lớn khi cuộn.
+            pageOrientation === "landscape"
+              ? "max-w-[1120px]"
+              : "max-w-[760px]",
+          )}
+          onDoubleClick={() => setIsReaderOpen(true)}
+          title="Nhấp đúp để mở toàn màn hình"
+        >
+          <canvas
+            ref={canvasRef}
+            aria-label={`Xem trước trang ${pageNumber}`}
+            className="block bg-white shadow-sm"
+            style={{
+              width: `${canvasCssSize.width}px`,
+              height: `${canvasCssSize.height}px`,
+              imageRendering: "auto",
+            }}
+          />
         </div>
-      )}
-      {error && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-red-50 p-4 text-center">
-          <p className="text-sm font-medium text-red-500">{error}</p>
-        </div>
-      )}
-      <div className="flex min-h-[236px] flex-1 items-center justify-center p-3">
-        <canvas
-          ref={canvasRef}
-          className="max-h-[420px] max-w-full object-contain"
-          style={{ imageRendering: "auto" }}
+
+        <button
+          type="button"
+          onClick={() => setIsReaderOpen(true)}
+          className="absolute right-2 top-2 z-20 inline-flex items-center gap-1 rounded-md border border-zinc-950/10 bg-white/95 px-2 py-1 text-[10px] font-bold text-zinc-800 opacity-0 shadow-sm transition hover:bg-white focus:opacity-100 group-hover:opacity-100"
+          title="Mở toàn màn hình để phóng to"
+        >
+          <Maximize2 className="h-3.5 w-3.5" />
+          Toàn màn
+        </button>
+        <span className="pointer-events-none absolute bottom-2 right-2 z-20 rounded bg-zinc-950/80 px-1.5 py-0.5 text-[10px] font-bold text-white shadow-sm backdrop-blur-sm">
+          Trang {pageNumber}
+        </span>
+      </section>
+
+      {isReaderOpen && (
+        <ReaderPreview
+          pdfDoc={pdfDoc}
+          pageNumber={pageNumber}
+          onClose={() => setIsReaderOpen(false)}
         />
-      </div>
-      <div className="w-full border-t border-zinc-100 bg-zinc-50 py-3 text-center text-sm font-bold uppercase tracking-tighter text-zinc-600">
-        Trang {pageNumber}
-      </div>
-    </div>
+      )}
+    </>
   );
 };
-
 
 type LandscapePanelProps = {
   src: string;
@@ -818,6 +1118,10 @@ const HomeLanding: React.FC<HomeLandingProps> = ({ onOpenMode }) => {
 
 export default function App() {
   const [mode, setMode] = useState<AppMode>("home");
+  // Khi đã vào một công cụ, ẩn thanh điều hướng lớn để dành chỗ cho vùng làm việc.
+  const [isToolsMenuOpen, setIsToolsMenuOpen] = useState(false);
+  const [isSplitControlsOpen, setIsSplitControlsOpen] = useState(true);
+  const [isSplitDetailsOpen, setIsSplitDetailsOpen] = useState(false);
 
   // Tách một PDF, có xem trước và tiến độ riêng theo số trang/lần tách.
   const [file, setFile] = useState<File | null>(null);
@@ -873,6 +1177,12 @@ export default function App() {
   const mergeAllInputRef = useRef<HTMLInputElement>(null);
   const batchSplitInputRef = useRef<HTMLInputElement>(null);
 
+  useEffect(() => {
+    if (mode !== "home") {
+      setIsToolsMenuOpen(false);
+    }
+  }, [mode]);
+
   const currentSplitRange = getSplitRange(
     currentIndex,
     totalPages,
@@ -881,6 +1191,7 @@ export default function App() {
   const currentPageIndices = currentSplitRange.pageIndices;
   const currentPageStart = currentSplitRange.startIndex + 1;
   const currentPageEnd = currentSplitRange.endIndexExclusive;
+
   const totalBatches = totalPages > 0 ? Math.ceil(totalPages / pagesPerBatch) : 0;
   const completedBatches = completedBatchesBySize[pagesPerBatch];
   const completedCount = completedBatches?.size ?? 0;
@@ -944,7 +1255,9 @@ export default function App() {
         ),
       );
       setIsSplitFileNameAuto(true);
+      setIsSplitDetailsOpen(false);
       setCompletedBatchesBySize({});
+      setIsToolsMenuOpen(false);
     } catch (error) {
       console.error("Error parsing PDF:", error);
       alert("Không thể đọc file PDF này. Vui lòng thử lại.");
@@ -1386,6 +1699,7 @@ export default function App() {
     setCurrentIndex(0);
     setFileName("");
     setIsSplitFileNameAuto(true);
+    setIsSplitDetailsOpen(false);
     setCompletedBatchesBySize({});
   };
 
@@ -1434,23 +1748,39 @@ export default function App() {
     (mode === "merge-all" && mergeAllFiles.length > 0) ||
     (mode === "batch-split" && batchSplitFiles.length > 0);
 
+  const activeModeLabel: Record<AppMode, string> = {
+    home: "Trang chủ",
+    split: "Tách 1 PDF",
+    "batch-split": "Tách hàng loạt",
+    "batch-merge": "Ghép trước/sau",
+    "merge-all": "Gộp 1 PDF",
+  };
+
   return (
     <div className="min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_12%_0%,rgba(224,231,255,0.8),transparent_23%),radial-gradient(circle_at_92%_12%,rgba(207,250,254,0.72),transparent_24%),#fdfdfd] font-sans text-zinc-900 selection:bg-violet-200">
       <header className="sticky top-0 z-50 border-b border-white/70 bg-white/70 backdrop-blur-xl">
-        <div className="mx-auto flex min-h-16 max-w-6xl items-center justify-between gap-4 px-5 py-2 sm:px-6">
+        <div
+          className={cn(
+            "mx-auto flex min-h-14 items-center justify-between gap-3 px-4 py-1.5 sm:px-5",
+            mode === "split" && file ? "max-w-[1600px]" : "max-w-6xl",
+          )}
+        >
           <button
             type="button"
             onClick={() => setMode("home")}
             className="group flex min-w-0 items-center gap-3 text-left"
             aria-label="Về trang chủ PDF Toolkit"
           >
-            <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-600 via-indigo-600 to-cyan-500 shadow-lg shadow-indigo-200 transition-transform group-hover:scale-105">
-              <FileText className="relative h-5 w-5 text-white" />
+            <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 via-indigo-600 to-cyan-500 shadow-lg shadow-indigo-200 transition-transform group-hover:scale-105">
+              <FileText className="relative h-4 w-4 text-white" />
               <span className="absolute -right-1 -top-1 h-3 w-3 rounded-full border-2 border-white bg-cyan-300" />
             </div>
             <div className="min-w-0">
-              <h1 className="truncate text-base font-black tracking-[-0.025em] text-zinc-900 sm:text-lg">PDF Toolkit - Ban Chỉ huy Quân sự Phường Tân Sơn Nhì - Ban Quân lực - Phát ba gai</h1>
-              <p className="hidden text-[11px] font-medium text-zinc-500 sm:block">Tách • ghép • sắp xếp hồ sơ</p>
+              <h1 className="truncate text-sm font-black tracking-[-0.025em] text-zinc-900 sm:text-base">
+                PDF Toolkit
+                <span className="hidden lg:inline"> • BCHQS P. Tân Sơn Nhì</span>
+              </h1>
+              <p className="hidden text-[10px] font-medium text-zinc-500 sm:block">Tách • ghép • sắp xếp hồ sơ</p>
             </div>
           </button>
 
@@ -1459,7 +1789,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setMode("home")}
-                className="hidden rounded-xl px-3 py-2 text-sm font-bold text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900 sm:inline-flex"
+                className="hidden rounded-lg px-2.5 py-1.5 text-xs font-bold text-zinc-500 transition hover:bg-zinc-100 hover:text-zinc-900 sm:inline-flex"
               >
                 Trang chủ
               </button>
@@ -1467,7 +1797,7 @@ export default function App() {
             {hasActiveFiles && (
               <button
                 onClick={resetCurrentMode}
-                className="inline-flex items-center gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm font-bold text-zinc-600 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-bold text-zinc-600 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
               >
                 <X className="h-4 w-4" />
                 <span className="hidden sm:inline">Hủy bỏ</span>
@@ -1477,69 +1807,100 @@ export default function App() {
         </div>
       </header>
 
-      <main className="mx-auto max-w-6xl px-5 py-7 sm:px-6 sm:py-10">
-        <div className="mb-7 flex flex-wrap gap-1.5 rounded-2xl border border-white/80 bg-white/75 p-1.5 shadow-[0_12px_30px_rgba(24,24,27,0.06)] backdrop-blur-sm sm:mb-10">
-          <button
-            onClick={() => setMode("home")}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-3 text-sm font-semibold transition-all sm:flex-none",
-              mode === "home"
-                ? "bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-200"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
-            )}
+      <main
+        className={cn(
+          "mx-auto px-5 sm:px-6",
+          mode === "split" && file
+            ? "max-w-[1600px] py-3 sm:py-3.5"
+            : "max-w-6xl py-7 sm:py-10",
+        )}
+      >
+        {mode === "home" || isToolsMenuOpen ? (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="mb-3 overflow-hidden rounded-xl border border-white/80 bg-white/75 p-1 shadow-[0_8px_20px_rgba(24,24,27,0.05)] backdrop-blur-sm"
           >
-            <span className="hidden sm:inline">Trang chủ</span>
-            <span className="sm:hidden">Home</span>
-          </button>
-          <button
-            onClick={() => setMode("split")}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-3 text-sm font-semibold transition-all sm:flex-none",
-              mode === "split"
-                ? "bg-zinc-900 text-white shadow-sm"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
-            )}
-          >
-            <FileText className="h-4 w-4" />
-            Tách 1 PDF
-          </button>
-          <button
-            onClick={() => setMode("batch-split")}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-3 text-sm font-semibold transition-all sm:flex-none",
-              mode === "batch-split"
-                ? "bg-zinc-900 text-white shadow-sm"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
-            )}
-          >
-            <Archive className="h-4 w-4" />
-            Tách hàng loạt
-          </button>
-          <button
-            onClick={() => setMode("batch-merge")}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-3 text-sm font-semibold transition-all sm:flex-none",
-              mode === "batch-merge"
-                ? "bg-zinc-900 text-white shadow-sm"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
-            )}
-          >
-            <Files className="h-4 w-4" />
-            Ghép trước/sau
-          </button>
-          <button
-            onClick={() => setMode("merge-all")}
-            className={cn(
-              "flex flex-1 items-center justify-center gap-2 rounded-xl px-3 py-3 text-sm font-semibold transition-all sm:flex-none",
-              mode === "merge-all"
-                ? "bg-zinc-900 text-white shadow-sm"
-                : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
-            )}
-          >
-            <Files className="h-4 w-4" />
-            Gộp 1 PDF
-          </button>
-        </div>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                onClick={() => setMode("home")}
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all sm:flex-none",
+                  mode === "home"
+                    ? "bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-md shadow-indigo-200"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
+                )}
+              >
+                <span className="hidden sm:inline">Trang chủ</span>
+                <span className="sm:hidden">Home</span>
+              </button>
+              <button
+                onClick={() => setMode("split")}
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all sm:flex-none",
+                  mode === "split"
+                    ? "bg-zinc-900 text-white shadow-sm"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
+                )}
+              >
+                <FileText className="h-4 w-4" />
+                Tách 1 PDF
+              </button>
+              <button
+                onClick={() => setMode("batch-split")}
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all sm:flex-none",
+                  mode === "batch-split"
+                    ? "bg-zinc-900 text-white shadow-sm"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
+                )}
+              >
+                <Archive className="h-4 w-4" />
+                Tách hàng loạt
+              </button>
+              <button
+                onClick={() => setMode("batch-merge")}
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all sm:flex-none",
+                  mode === "batch-merge"
+                    ? "bg-zinc-900 text-white shadow-sm"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
+                )}
+              >
+                <Files className="h-4 w-4" />
+                Ghép trước/sau
+              </button>
+              <button
+                onClick={() => setMode("merge-all")}
+                className={cn(
+                  "flex flex-1 items-center justify-center gap-1.5 rounded-lg px-2.5 py-2 text-xs font-semibold transition-all sm:flex-none",
+                  mode === "merge-all"
+                    ? "bg-zinc-900 text-white shadow-sm"
+                    : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900",
+                )}
+              >
+                <Files className="h-4 w-4" />
+                Gộp 1 PDF
+              </button>
+            </div>
+          </motion.div>
+        ) : (
+          <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-zinc-200 bg-white/90 px-3 py-2 shadow-sm">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-bold text-zinc-700">{activeModeLabel[mode]}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setIsToolsMenuOpen(true)}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-bold text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50"
+              aria-expanded={false}
+            >
+              Đổi
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
 
         <AnimatePresence mode="wait">
           {mode === "home" && <HomeLanding onOpenMode={setMode} />}
@@ -1582,157 +1943,243 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="grid grid-cols-1 gap-12 lg:grid-cols-12">
-                  <div className="space-y-8 lg:col-span-7">
-                    <div className="flex items-center justify-between gap-4">
-                      <div>
-                        <h2 className="text-2xl font-bold tracking-tight">Xem trước trang</h2>
-                        <p className="mt-1 text-sm text-zinc-500">
-                          Đang chọn trang {currentPageStart} – {currentPageEnd} trên tổng số {" "}
-                          {totalPages} trang
+                <div
+                  className={cn(
+                    "grid min-w-0 grid-cols-1 gap-3 lg:h-[calc(100dvh-134px)] lg:min-h-0 lg:max-h-[calc(100dvh-134px)] lg:items-stretch",
+                    isSplitControlsOpen
+                      ? "lg:grid-cols-[minmax(0,1fr)_300px]"
+                      : "lg:grid-cols-[minmax(0,1fr)_118px]",
+                  )}
+                >
+                  <section className="flex min-w-0 flex-col gap-2 lg:min-h-0">
+                    <div className="flex shrink-0 flex-col gap-2 rounded-xl border border-zinc-200 bg-white px-3 py-2.5 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-zinc-400">Tách PDF</p>
+                        <h2 className="mt-0.5 text-lg font-black tracking-tight text-zinc-900 sm:text-xl">
+                          Trang {currentPageStart} – {currentPageEnd}
+                          <span className="font-medium text-zinc-400"> / {totalPages}</span>
+                        </h2>
+                        <p className="mt-0.5 truncate text-[11px] font-medium text-zinc-500" title={file.name}>
+                          {file.name}
                         </p>
                       </div>
-                      <div className="flex shrink-0 items-center gap-2">
+
+                      <div className="flex shrink-0 items-center gap-1.5">
                         <button
+                          type="button"
                           onClick={handlePrev}
                           disabled={currentIndex === 0}
-                          className="rounded-full p-2 transition-colors hover:bg-zinc-100 disabled:opacity-30"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-30"
                           aria-label="Nhóm trang trước"
+                          title="Nhóm trang trước"
                         >
-                          <ChevronLeft className="h-6 w-6" />
+                          <ChevronLeft className="h-4 w-4" />
                         </button>
                         <button
+                          type="button"
                           onClick={handleJumpPrompt}
-                          className="rounded-lg border border-zinc-200 px-3 py-1.5 text-sm font-semibold transition hover:bg-zinc-100"
+                          className="rounded-lg border border-zinc-200 bg-white px-2.5 py-1.5 text-xs font-bold text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50"
                         >
-                          Tới trang bắt đầu
+                          Tới trang
                         </button>
                         <button
+                          type="button"
                           onClick={handleNext}
                           disabled={currentPageEnd >= totalPages}
-                          className="rounded-full p-2 transition-colors hover:bg-zinc-100 disabled:opacity-30"
+                          className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-200 bg-white text-zinc-700 transition hover:border-zinc-400 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-30"
                           aria-label="Nhóm trang tiếp theo"
+                          title="Nhóm trang tiếp theo"
                         >
-                          <ChevronRight className="h-6 w-6" />
+                          <ChevronRight className="h-4 w-4" />
                         </button>
                       </div>
                     </div>
 
-                    <div className="flex min-h-[500px] flex-col gap-4 rounded-[32px] border border-zinc-200/60 bg-zinc-100/50 p-6">
-                      {currentPageIndices.map((pageIndex) => (
-                        <PagePreview
-                          key={`${file.name}-${file.lastModified}-${pageIndex}`}
-                          pdfDoc={pdfDoc}
-                          pageNumber={pageIndex + 1}
-                        />
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="h-fit space-y-8 lg:sticky lg:top-28 lg:col-span-5">
-                    <div className="space-y-3">
-                      <label className="text-xs font-bold uppercase tracking-widest text-zinc-400">
-                        Số trang của nhóm đang chọn
-                      </label>
-                      <div className="grid grid-cols-5 gap-2">
-                        {Array.from({ length: 10 }).map((_, index) => {
-                          const value = index + 1;
-                          const isActive = pagesPerBatch === value;
-                          return (
-                            <button
-                              key={value}
-                              onClick={() => handlePagesPerBatchChange(value)}
-                              className={cn(
-                                "rounded-xl border py-2 text-sm font-semibold transition-all",
-                                isActive
-                                  ? "scale-105 border-zinc-900 bg-zinc-900 text-white shadow-md"
-                                  : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900",
-                              )}
-                            >
-                              {value}
-                            </button>
-                          );
-                        })}
+                    {/* Chế độ đọc dọc với cỡ hiển thị vừa phải: giữ đúng tỷ lệ A4/A3,
+                        nhưng không kéo trang dọc phủ kín cả chiều ngang. Khi cần soi chữ nhỏ,
+                        dùng nút Toàn màn trên từng trang. */}
+                    <div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-zinc-200 bg-zinc-200 shadow-sm">
+                      <div className="h-full min-h-0 overflow-x-auto overflow-y-auto bg-zinc-200">
+                        <div className="mx-auto flex min-h-full w-full max-w-[1280px] flex-col gap-3 bg-zinc-200 p-1.5 sm:p-2">
+                          {currentPageIndices.map((pageIndex) => (
+                            <PagePreview
+                              key={`${file.name}-${file.lastModified}-${pageIndex}`}
+                              pdfDoc={pdfDoc}
+                              pageNumber={pageIndex + 1}
+                            />
+                          ))}
+                        </div>
                       </div>
-                      <p className="text-xs text-zinc-400">
-                        Nhóm hiện tại gồm tối đa {" "}
-                        <span className="font-semibold text-zinc-700">
-                          {pagesPerBatch} trang
-                        </span>
-                      </p>
                     </div>
+                  </section>
 
-                    <div className="space-y-6 rounded-3xl border border-zinc-200 bg-white p-8 shadow-sm">
-                      <div className="space-y-2">
-                        <label className="text-xs font-bold uppercase tracking-widest text-zinc-400">
-                          Tên file xuất ra
-                        </label>
-                        <input
-                          type="text"
-                          value={fileName}
-                          onChange={(event) => {
-                            setFileName(event.target.value);
-                            setIsSplitFileNameAuto(false);
-                          }}
-                          placeholder="Nhập tên file..."
-                          className="w-full rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 font-medium transition-all focus:border-zinc-900 focus:outline-none focus:ring-2 focus:ring-zinc-900/5"
-                        />
-                      </div>
+                  <aside className="min-w-0 space-y-2 lg:max-h-full lg:overflow-y-auto">
+                    {isSplitControlsOpen ? (
+                      <section className="rounded-xl border border-zinc-200 bg-white p-3 shadow-sm">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-zinc-400">
+                              Số trang / file
+                            </p>
+                            <p className="mt-0.5 text-xs font-medium leading-4 text-zinc-600">
+                              Giữ trang {currentPageStart} làm trang đầu.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setIsSplitControlsOpen(false)}
+                            className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-zinc-200 px-2 py-1 text-[10px] font-bold text-zinc-600 transition hover:border-zinc-400 hover:bg-zinc-50"
+                            title="Thu gọn bảng điều khiển để mở rộng vùng xem trước"
+                          >
+                            Thu gọn
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
 
-                      <button
-                        onClick={handleExport}
-                        disabled={isExporting}
-                        className="flex w-full items-center justify-center gap-3 rounded-2xl bg-zinc-900 py-4 font-semibold text-white transition-all hover:bg-zinc-800 active:scale-[0.98] disabled:opacity-50"
-                      >
-                        {isExporting ? (
-                          <Loader2 className="h-5 w-5 animate-spin" />
-                        ) : (
-                          <Download className="h-5 w-5" />
-                        )}
-                        {isExporting ? "Đang xuất..." : "Tách và tải về"}
-                      </button>
+                        <div className="mt-3 grid grid-cols-5 gap-1">
+                          {Array.from({ length: 10 }).map((_, index) => {
+                            const value = index + 1;
+                            const isActive = pagesPerBatch === value;
+                            return (
+                              <button
+                                key={value}
+                                type="button"
+                                onClick={() => handlePagesPerBatchChange(value)}
+                                className={cn(
+                                  "rounded-md border py-1.5 text-xs font-bold transition-all",
+                                  isActive
+                                    ? "border-zinc-900 bg-zinc-900 text-white shadow-sm"
+                                    : "border-zinc-200 bg-white text-zinc-600 hover:border-zinc-400 hover:bg-zinc-50",
+                                )}
+                              >
+                                {value}
+                              </button>
+                            );
+                          })}
+                        </div>
 
-                      <div className="border-t border-zinc-100 pt-4">
-                        <div className="flex items-center justify-between text-sm">
-                          <span className="text-zinc-500">Tiến độ tách file</span>
-                          <span className="font-bold">
-                            {completedCount} / {totalBatches}
+                        <button
+                          type="button"
+                          onClick={handleExport}
+                          disabled={isExporting}
+                          className="mt-3 flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-zinc-900 px-3 text-xs font-bold text-white transition hover:bg-zinc-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {isExporting ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4" />
+                          )}
+                          {isExporting ? "Đang xuất..." : `Tách ${currentPageStart}–${currentPageEnd}`}
+                        </button>
+
+                        <div className="mt-3 border-t border-zinc-100 pt-3">
+                          <button
+                            type="button"
+                            onClick={() => setIsSplitDetailsOpen((previous) => !previous)}
+                            className="flex w-full items-center justify-between gap-2 text-left"
+                            aria-expanded={isSplitDetailsOpen}
+                          >
+                            <span>
+                              <span className="block text-xs font-bold text-zinc-800">Tên file & tiến độ</span>
+                              <span className="mt-0.5 block text-[10px] text-zinc-500">Mở khi cần chỉnh thêm.</span>
+                            </span>
+                            {isSplitDetailsOpen ? (
+                              <ChevronUp className="h-4 w-4 shrink-0 text-zinc-500" />
+                            ) : (
+                              <ChevronDown className="h-4 w-4 shrink-0 text-zinc-500" />
+                            )}
+                          </button>
+
+                          <AnimatePresence initial={false}>
+                            {isSplitDetailsOpen && (
+                              <motion.div
+                                initial={{ opacity: 0, height: 0 }}
+                                animate={{ opacity: 1, height: "auto" }}
+                                exit={{ opacity: 0, height: 0 }}
+                                className="overflow-hidden"
+                              >
+                                <div className="space-y-3 pt-3">
+                                  <div className="space-y-1.5">
+                                    <label className="text-[10px] font-bold uppercase tracking-[0.14em] text-zinc-400">
+                                      Tên file xuất ra
+                                    </label>
+                                    <input
+                                      type="text"
+                                      value={fileName}
+                                      onChange={(event) => {
+                                        setFileName(event.target.value);
+                                        setIsSplitFileNameAuto(false);
+                                      }}
+                                      placeholder="Nhập tên file..."
+                                      className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-2.5 py-2 text-xs font-medium transition focus:border-zinc-900 focus:outline-none focus:ring-2 focus:ring-zinc-900/5"
+                                    />
+                                  </div>
+
+                                  <div className="border-t border-zinc-100 pt-3">
+                                    <div className="flex items-center justify-between text-xs">
+                                      <span className="font-medium text-zinc-500">Tiến độ</span>
+                                      <span className="font-black text-zinc-800">{completedCount} / {totalBatches}</span>
+                                    </div>
+                                    <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-zinc-100">
+                                      <motion.div
+                                        initial={{ width: 0 }}
+                                        animate={{ width: `${splitProgressPercent}%` }}
+                                        className="h-full rounded-full bg-zinc-900"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <p className="text-[10px] leading-4 text-zinc-500">
+                                    Preview giữ đúng tỷ lệ A4/A3 với cỡ vừa phải; mở “Toàn màn” trên từng trang khi cần đọc kỹ.
+                                  </p>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                      </section>
+                    ) : (
+                      <section className="rounded-xl border border-zinc-200 bg-white p-2 shadow-sm">
+                        <button
+                          type="button"
+                          onClick={() => setIsSplitControlsOpen(true)}
+                          className="flex w-full items-center justify-between rounded-lg border border-zinc-200 bg-zinc-50 px-2 py-2 text-left transition hover:border-zinc-400"
+                          title="Mở bảng điều khiển tách PDF"
+                        >
+                          <span>
+                            <span className="block text-[10px] font-bold uppercase tracking-wide text-zinc-400">Tách</span>
+                            <span className="block text-sm font-black text-zinc-800">{pagesPerBatch} tr</span>
                           </span>
-                        </div>
-                        <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-zinc-100">
-                          <motion.div
-                            initial={{ width: 0 }}
-                            animate={{ width: `${splitProgressPercent}%` }}
-                            className="h-full rounded-full bg-zinc-900"
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    {currentBatchCompleted && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        className="flex items-center gap-3 rounded-2xl border border-emerald-100 bg-emerald-50 p-4 text-emerald-700"
-                      >
-                        <CheckCircle2 className="h-5 w-5" />
-                        <span className="text-sm font-medium">
-                          Nhóm trang này đã được tải về với lựa chọn hiện tại.
-                        </span>
-                      </motion.div>
+                          <ChevronLeft className="h-4 w-4 text-zinc-600" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleExport}
+                          disabled={isExporting}
+                          className="mt-2 flex h-9 w-full items-center justify-center gap-1.5 rounded-lg bg-zinc-900 px-1.5 text-[11px] font-bold text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                          title={`Tách trang ${currentPageStart} đến ${currentPageEnd}`}
+                        >
+                          {isExporting ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Download className="h-4 w-4" />
+                          )}
+                          <span>{isExporting ? "..." : "Tách"}</span>
+                        </button>
+                      </section>
                     )}
 
-                    <div className="rounded-2xl border border-zinc-200/60 bg-zinc-50 p-6">
-                      <h3 className="mb-3 text-sm font-bold uppercase tracking-wider text-zinc-400">
-                        Hướng dẫn
-                      </h3>
-                      <ol className="space-y-3 text-sm text-zinc-600">
-                        <li>1. Chọn số trang của nhóm đang xem; preview và file tải về luôn cùng một nhóm trang.</li>
-                        <li>2. “Tới trang bắt đầu” sẽ mở đúng trang bạn nhập làm trang đầu tiên của nhóm.</li>
-                        <li>3. Tên file tự đổi theo nhóm trang hiện tại; khi tự sửa tên, hệ thống sẽ giữ nguyên tên bạn đặt.</li>
-                      </ol>
-                    </div>
-                  </div>
+                    {isSplitControlsOpen && currentBatchCompleted && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="flex items-center gap-2 rounded-lg border border-emerald-100 bg-emerald-50 px-2.5 py-2 text-emerald-700"
+                      >
+                        <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                        <span className="text-[10px] font-semibold">Nhóm này đã tải về.</span>
+                      </motion.div>
+                    )}
+                  </aside>
                 </div>
               )}
             </motion.div>
