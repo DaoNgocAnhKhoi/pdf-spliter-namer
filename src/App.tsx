@@ -1449,7 +1449,7 @@ export default function App() {
               <span className="absolute -right-1 -top-1 h-3 w-3 rounded-full border-2 border-white bg-cyan-300" />
             </div>
             <div className="min-w-0">
-              <h1 className="truncate text-base font-black tracking-[-0.025em] text-zinc-900 sm:text-lg">PDF Toolkit - Ban Chỉ huy Quân sự Phường Tân Sơn Nhì - Ban Quân lực</h1>
+              <h1 className="truncate text-base font-black tracking-[-0.025em] text-zinc-900 sm:text-lg">PDF Toolkit - Ban Chỉ huy Quân sự Phường Tân Sơn Nhì - Ban Quân lực - Phát ba gai</h1>
               <p className="hidden text-[11px] font-medium text-zinc-500 sm:block">Tách • ghép • sắp xếp hồ sơ</p>
             </div>
           </button>
